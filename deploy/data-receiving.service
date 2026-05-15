@@ -1,0 +1,19 @@
+[Unit]
+Description=Data Receiving Module — DTU binary frame parser
+After=network.target
+
+[Service]
+Type=simple
+User=data-receiving
+Group=data-receiving
+WorkingDirectory=/opt/data-receiving
+EnvironmentFile=/opt/data-receiving/.env
+ExecStart=/opt/data-receiving/DataReceiving
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=data-receiving
+
+[Install]
+WantedBy=multi-user.target

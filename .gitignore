@@ -1,0 +1,31 @@
+# .NET build output
+bin/
+obj/
+publish/
+
+# Test results
+*.trx
+TestResults/
+
+# Runtime directories created by the app
+dlx/
+output/
+
+# Environment secrets — use deploy/.env.example as the template
+.env
+
+# Visual Studio / Rider
+.vs/
+.idea/
+*.user
+*.suo
+
+# JetBrains Rider
+*.sln.iml
+
+# VS Code
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db

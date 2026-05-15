@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Restore
+        run: dotnet restore DataReceiving.sln
+
+      - name: Build
+        run: dotnet build DataReceiving.sln --no-restore -c Release
+
+      - name: Test
+        run: dotnet test DataReceiving.sln --no-build -c Release --logger "github;verbosity=normal" --logger "trx;LogFileName=results.trx"
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: "**/*.trx"
+
+      - name: Publish (linux-x64 self-contained)
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: |
+          dotnet publish src/DataReceiving/DataReceiving.csproj \
+            -c Release \
+            -r linux-x64 \
+            --self-contained true \
+            -p:PublishSingleFile=true \
+            -p:DebugType=none \
+            -o publish/
+
+      - name: Upload deployable artifact
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: data-receiving-linux-x64
+          path: |
+            publish/
+            deploy/
+          retention-days: 30
