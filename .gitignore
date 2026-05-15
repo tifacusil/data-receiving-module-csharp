@@ -29,3 +29,6 @@ output/
 # OS
 .DS_Store
 Thumbs.db
+src/DataReceiving/DataReceiving.csproj.lscache
+tests/DataReceiving.IntegrationTests/DataReceiving.IntegrationTests.csproj.lscache
+tests/DataReceiving.UnitTests/DataReceiving.UnitTests.csproj.lscache
