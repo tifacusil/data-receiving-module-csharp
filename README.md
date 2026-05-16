@@ -1,8 +1,8 @@
 # Data Receiving Module (C#)
 
-Parser microservice for the landslide monitoring system described in Bai et al. (2020). Receives binary DTU frames over TCP, validates them, and produces JSON envelopes conforming to the shared contract.
+Parser + publisher microservice for the landslide monitoring system described in Bai et al. (2020). Receives binary DTU frames over TCP, validates them, produces JSON envelopes, and publishes them to RabbitMQ with Redis as a durability buffer.
 
-Implements **Card 2A1** (parser + TCP server). RabbitMQ publishing (2A2) and Consul registration (2A3) are not included here.
+Implements **Card 2A1** (parser + TCP server) and **Card 2A2** (Redis buffer + RabbitMQ publishing). Consul registration (2A3) is not included here.
 
 ---
 
@@ -10,13 +10,16 @@ Implements **Card 2A1** (parser + TCP server). RabbitMQ publishing (2A2) and Con
 
 1. [Local development](#local-development)
 2. [Configuration](#configuration)
-3. [Deploying to Linux (Ubuntu 24.04)](#deploying-to-linux-ubuntu-2404)
-4. [Managing the service](#managing-the-service)
-5. [Running multiple instances](#running-multiple-instances)
-6. [Running with the Python sender](#running-with-the-python-sender)
-7. [Architecture](#architecture)
-8. [Sensor types](#sensor-types)
-9. [Dead letter format](#dead-letter-format)
+3. [Wave 1 infrastructure](#wave-1-infrastructure)
+4. [RabbitMQ topology](#rabbitmq-topology)
+5. [Redis buffer](#redis-buffer)
+6. [Deploying to Linux (Ubuntu 24.04)](#deploying-to-linux-ubuntu-2404)
+7. [Managing the service](#managing-the-service)
+8. [Running multiple instances](#running-multiple-instances)
+9. [Running with the Python sender](#running-with-the-python-sender)
+10. [Architecture](#architecture)
+11. [Sensor types](#sensor-types)
+12. [Dead letter format](#dead-letter-format)
 
 ---
 
@@ -28,10 +31,19 @@ Implements **Card 2A1** (parser + TCP server). RabbitMQ publishing (2A2) and Con
 # Build
 dotnet build DataReceiving.sln
 
-# Test (62 tests — must all pass)
+# Test — 62 parser tests run locally with no external services
+# 13 additional tests (Redis + RabbitMQ) run in CI
 dotnet test DataReceiving.sln
 
-# Run locally
+# Run locally in stdout mode (no Redis/RabbitMQ needed)
+dotnet run --project src/DataReceiving
+
+# Run locally in rabbitmq mode (requires Wave 1 infra reachable)
+RECEIVER__OUTPUTMODE=rabbitmq \
+RECEIVER__REDIS__CONNECTIONSTRING="204.168.203.32:6379,password=<Redis password>" \
+RECEIVER__RABBITMQ__HOST=204.168.203.32 \
+RECEIVER__RABBITMQ__USERNAME=data-receiver \
+RECEIVER__RABBITMQ__PASSWORD=<RabbitMQ password> \
 dotnet run --project src/DataReceiving
 ```
 
@@ -39,9 +51,9 @@ dotnet run --project src/DataReceiving
 
 ## Configuration
 
-All settings live in `appsettings.json` and can be overridden by environment variables. The convention is `RECEIVER__` prefix with double underscores as section separators (`RECEIVER__REDIS__CONNECTIONSTRING`, etc.). Environment variables always win over the file.
+All settings live in `appsettings.json` and can be overridden by environment variables. The convention is `RECEIVER__` prefix with double underscores as section separators. Environment variables always win over the file.
 
-### Core settings
+### Core
 
 | Env var | Default | Description |
 |---|---|---|
@@ -50,14 +62,16 @@ All settings live in `appsettings.json` and can be overridden by environment var
 | `RECEIVER__OUTPUTMODE` | `stdout` | `stdout` · `file` · `null` · `rabbitmq` |
 | `RECEIVER__OUTPUTFILEPATH` | `./output` | Directory for JSON files when `OutputMode=file` |
 
+Setting `OutputMode=rabbitmq` activates the Redis buffer and RabbitMQ publisher. The other modes (`stdout`, `file`, `null`) work without any external services and are useful for local development and testing.
+
 ### Redis (required when `OutputMode=rabbitmq`)
 
 | Env var | Wave 1 value | Description |
 |---|---|---|
-| `RECEIVER__REDIS__CONNECTIONSTRING` | `204.168.203.32:6379,password=<Redis password>` | StackExchange.Redis connection string |
+| `RECEIVER__REDIS__CONNECTIONSTRING` | `204.168.203.32:6379,password=<secret>` | StackExchange.Redis connection string — include `,password=` inline |
 | `RECEIVER__REDIS__BUFFERTLTHOURS` | `24` | How long a message stays buffered if RabbitMQ is down |
-| `RECEIVER__REDIS__RETRYINTERVALSECONDS` | `30` | How often RetryWorker scans for unsent messages |
-| `RECEIVER__REDIS__RETRYMINAGEMINUTES` | `2` | Minimum age before RetryWorker retries a buffered message |
+| `RECEIVER__REDIS__RETRYINTERVALSECONDS` | `30` | How often `RetryWorker` scans for unsent messages |
+| `RECEIVER__REDIS__RETRYMINAGEMINUTES` | `2` | Minimum message age before `RetryWorker` retries it |
 
 ### RabbitMQ (required when `OutputMode=rabbitmq`)
 
@@ -67,11 +81,107 @@ All settings live in `appsettings.json` and can be overridden by environment var
 | `RECEIVER__RABBITMQ__PORT` | `5672` | AMQP port |
 | `RECEIVER__RABBITMQ__VIRTUALHOST` | `/` | Virtual host |
 | `RECEIVER__RABBITMQ__USERNAME` | `data-receiver` | AMQP user |
-| `RECEIVER__RABBITMQ__PASSWORD` | *(secrets file)* | Never commit — set in `/etc/data-receiving/secrets` |
-| `RECEIVER__RABBITMQ__EXCHANGE` | `sensors.raw` | Topic exchange (declared by Wave 1) |
-| `RECEIVER__RABBITMQ__CONFIRMTIMEOUTSECONDS` | `5` | Timeout for Publisher Confirms |
+| `RECEIVER__RABBITMQ__PASSWORD` | *(secrets file only)* | Never commit — lives in `/etc/data-receiving/secrets` |
+| `RECEIVER__RABBITMQ__EXCHANGE` | `sensors.raw` | Topic exchange declared by Wave 1 |
+| `RECEIVER__RABBITMQ__CONFIRMTIMEOUTSECONDS` | `5` | Publisher Confirms timeout |
 
-> **Password rule:** `RECEIVER__RABBITMQ__PASSWORD` must never go into `.env` or any file tracked by git. It belongs exclusively in `/etc/data-receiving/secrets` (permissions `640`, owner `root:data-receiving`).
+> **Password rule:** `RECEIVER__RABBITMQ__PASSWORD` must never appear in `.env` or any file tracked by git. It belongs exclusively in `/etc/data-receiving/secrets` (permissions `640`, owner `root:data-receiving`).
+
+---
+
+## Wave 1 infrastructure
+
+All external services run on a single Wave 1 server. Credentials are stored only in `/etc/data-receiving/secrets` on each deployment host — never in this repository.
+
+| Service | Host | Port | Notes |
+|---|---|---|---|
+| RabbitMQ AMQP | `204.168.203.32` | `5672` | User: `data-receiver` |
+| RabbitMQ Management UI | `204.168.203.32` | `15672` | `http://204.168.203.32:15672` |
+| Redis | `204.168.203.32` | `6379` | Password required — include in connection string |
+| Consul | `204.168.203.32` | `8500` | Used by Card 2A3 (not implemented here) |
+
+Verify connectivity before deploying:
+
+```bash
+# Redis
+nc -z -w3 204.168.203.32 6379 && echo "Redis OK"
+
+# RabbitMQ AMQP
+nc -z -w3 204.168.203.32 5672 && echo "RabbitMQ OK"
+
+# RabbitMQ Management (replace <user> and <pass>)
+curl -s -u '<user>:<pass>' http://204.168.203.32:15672/api/overview | python3 -m json.tool | grep rabbitmq_version
+```
+
+---
+
+## RabbitMQ topology
+
+The exchange and queues were declared by Wave 1. This service **only publishes** — it never declares or modifies the topology.
+
+| Element | Value |
+|---|---|
+| Exchange | `sensors.raw` |
+| Type | `topic` |
+| Durable | `true` |
+| Routing key pattern | `sensors.{project_id}.{sensor_type}` |
+| Delivery mode | `2` (persistent) |
+
+Routing keys produced by this service:
+
+| Sensor type | Example project | Routing key |
+|---|---|---|
+| `gnss` | `shangtan` | `sensors.shangtan.gnss` |
+| `rainfall` | `shangtan` | `sensors.shangtan.rainfall` |
+| `strain` | `shangtan` | `sensors.shangtan.strain` |
+| `soil_pressure` | `shangtan` | `sensors.shangtan.soil_pressure` |
+| `deep_displacement` | `lingzhan` | `sensors.lingzhan.deep_displacement` |
+
+The `project_id` and `sensor_type` come directly from the parsed envelope — no mapping or transformation is applied.
+
+Inspect live queue state via the management UI or CLI:
+
+```bash
+# Messages waiting in a queue (replace <queue>, <user>, <pass>)
+curl -s -u '<user>:<pass>' \
+  http://204.168.203.32:15672/api/queues/%2F/<queue> \
+  | python3 -c "import sys,json; d=json.load(sys.stdin); print('messages:', d['messages'])"
+```
+
+---
+
+## Redis buffer
+
+When `OutputMode=rabbitmq` the service writes every parsed envelope to Redis **before** attempting to publish, and deletes it only after the broker confirms receipt (Publisher Confirms). This prevents data loss if RabbitMQ is unavailable.
+
+**Key format:** `sensor_buffer:{message_id}`
+
+**Value:** JSON wrapper stored as a Redis string:
+
+```json
+{
+  "stored_at": "2026-05-12T14:30:00.123Z",
+  "routing_key": "sensors.shangtan.gnss",
+  "message_id": "550e8400-e29b-41d4-a716-446655440000",
+  "envelope_json": "{...full envelope...}"
+}
+```
+
+**TTL:** 24 hours. If RabbitMQ stays down longer than the TTL the buffered message expires and is lost.
+
+**RetryWorker** runs every 30 seconds, scans for keys older than 2 minutes, and retries publishing each one. On success it deletes the key. Counts and outcomes are logged at `Information` level.
+
+Inspect the buffer:
+
+```bash
+# Count buffered messages (replace <pass>)
+redis-cli -h 204.168.203.32 -p 6379 -a '<pass>' --no-auth-warning \
+  SCAN 0 MATCH "sensor_buffer:*" COUNT 1000
+
+# Read a specific key
+redis-cli -h 204.168.203.32 -p 6379 -a '<pass>' --no-auth-warning \
+  GET "sensor_buffer:<message_id>"
+```
 
 ---
 
@@ -79,7 +189,7 @@ All settings live in `appsettings.json` and can be overridden by environment var
 
 ### Option A — via GitHub Actions (recommended)
 
-Every push to `main` produces a deployable artifact in the Actions tab: **`data-receiving-linux-x64`**. It contains a self-contained binary (no .NET runtime needed on the server) and the `deploy/` folder.
+Every push to `main` produces a deployable artifact: **`data-receiving-linux-x64`** (self-contained binary + `deploy/` folder, no .NET runtime needed on the server).
 
 1. Go to **Actions → latest green run → Artifacts → `data-receiving-linux-x64`** and download the zip.
 
@@ -93,16 +203,13 @@ scp data-receiving-linux-x64.zip user@your-server:~
 
 ```bash
 unzip data-receiving-linux-x64.zip -d release
-sudo bash release/deploy/install.sh
+sudo RABBITMQ_PASSWORD="<RabbitMQ password>" \
+     REDIS_HOST="204.168.203.32" \
+     RABBITMQ_HOST="204.168.203.32" \
+     bash release/deploy/install.sh
 ```
 
-4. Edit the environment file with your values:
-
-```bash
-sudo nano /opt/data-receiving/.env
-```
-
-5. Start:
+4. Start and verify:
 
 ```bash
 sudo systemctl start data-receiving
@@ -130,8 +237,11 @@ scp -r publish/ deploy/ user@your-server:~/data-receiving-release/
 On the server:
 
 ```bash
-sudo bash ~/data-receiving-release/deploy/install.sh
-sudo nano /opt/data-receiving/.env
+cd ~/data-receiving-release
+sudo RABBITMQ_PASSWORD="<RabbitMQ password>" \
+     REDIS_HOST="204.168.203.32" \
+     RABBITMQ_HOST="204.168.203.32" \
+     bash deploy/install.sh
 sudo systemctl start data-receiving
 ```
 
@@ -139,30 +249,28 @@ sudo systemctl start data-receiving
 
 ### What the installer does
 
-`deploy/install.sh` performs these steps (requires root):
+`deploy/install.sh` (requires root, reads `RABBITMQ_PASSWORD`, `REDIS_HOST`, `RABBITMQ_HOST`):
 
-1. Creates a dedicated system user `data-receiving` with no login shell.
-2. Copies the binary and deploy files to `/opt/data-receiving/`.
-3. Creates `/opt/data-receiving/dlx/` and `/opt/data-receiving/output/`.
-4. Copies `deploy/.env.example` to `/opt/data-receiving/.env` if no `.env` exists yet.
-5. Installs `deploy/data-receiving.service` into `/etc/systemd/system/` and enables it (starts on boot).
+1. Creates system user `data-receiving` (no shell, no home).
+2. Copies the self-contained binary to `/opt/data-receiving/`.
+3. Creates `/var/log/data-receiving/dlx/`.
+4. Writes `/etc/data-receiving/secrets` containing only `RECEIVER__RABBITMQ__PASSWORD` — permissions `640`, owner `root:data-receiving`.
+5. Substitutes `<redis-host>` and `<rabbitmq-host>` placeholders in `deploy/data-receiving.service` and installs it to `/etc/systemd/system/`.
+6. Runs `systemctl daemon-reload`, enables and restarts the service.
 
-The installer is idempotent: running it again on an existing installation updates the binary and unit file without touching your `.env`.
+The installer is idempotent: running it again updates the binary and unit file without touching secrets.
 
 ---
 
-### The .env file
+### Secrets file
 
-`/opt/data-receiving/.env` is the only file you need to edit after installation. It uses plain `KEY=VALUE` syntax — no quotes needed for simple values.
+`/etc/data-receiving/secrets` is the only file that holds a credential. It is created by `install.sh` and never tracked by git:
 
-```bash
-RECEIVER__PORT=5000
-RECEIVER__DLXPATH=/opt/data-receiving/dlx
-RECEIVER__OUTPUTMODE=stdout
-RECEIVER__OUTPUTFILEPATH=/opt/data-receiving/output
+```
+RECEIVER__RABBITMQ__PASSWORD=<RabbitMQ password>
 ```
 
-The file is owned by the `data-receiving` user and readable only by that user and root (`chmod 640`). Never commit it to git — use `deploy/.env.example` as the template.
+The systemd unit reads it via `EnvironmentFile=/etc/data-receiving/secrets`. All other configuration lives in the `Environment=` directives inside the unit file itself (host, port, username, exchange, etc. — nothing sensitive).
 
 ---
 
@@ -205,19 +313,28 @@ sudo systemctl disable data-receiving
 ### Updating the binary
 
 ```bash
-# Build new artifact, copy to server, then:
 sudo systemctl stop data-receiving
-sudo cp DataReceiving /opt/data-receiving/DataReceiving
+sudo cp -r publish/. /opt/data-receiving/
+sudo chown -R data-receiving:data-receiving /opt/data-receiving/
+sudo chmod +x /opt/data-receiving/DataReceiving
 sudo systemctl start data-receiving
 ```
 
-The `.env` is not touched during updates.
+Secrets and unit file are not touched.
+
+### Monitoring Redis buffer after deploy
+
+```bash
+# Should reach 0 within a few seconds if RabbitMQ is reachable
+redis-cli -h 204.168.203.32 -p 6379 -a '<pass>' --no-auth-warning \
+  SCAN 0 MATCH "sensor_buffer:*" COUNT 1000 | grep -c "sensor_buffer"
+```
 
 ---
 
 ## Running multiple instances
 
-The paper (Bai et al., Table 2) deploys three instances across heterogeneous hardware. Each instance is an independent process on its own host, listening on the same port. A load balancer or the DTU itself distributes connections across hosts.
+The paper (Bai et al., Table 2) deploys three instances across heterogeneous hardware. Each instance is an independent process on its own host, listening on the same port. All instances publish to the same RabbitMQ exchange — the broker handles fan-out.
 
 To run two instances on the **same host** (e.g. for testing):
 
@@ -228,20 +345,21 @@ sudo cp /etc/systemd/system/data-receiving.service \
         /etc/systemd/system/data-receiving-2.service
 ```
 
-2. Edit `data-receiving-2.service` — change `WorkingDirectory`, `EnvironmentFile`, and `SyslogIdentifier`:
+2. Edit `data-receiving-2.service` — change `ExecStart`, `WorkingDirectory`, and `SyslogIdentifier`:
 
 ```ini
 WorkingDirectory=/opt/data-receiving-2
-EnvironmentFile=/opt/data-receiving-2/.env
+ExecStart=/opt/data-receiving-2/DataReceiving
 SyslogIdentifier=data-receiving-2
 ```
 
-3. Create the second directory, copy the binary, write a `.env` with a different port:
+3. Create the second directory with a different port:
 
 ```bash
-sudo mkdir -p /opt/data-receiving-2/{dlx,output}
-sudo cp /opt/data-receiving/DataReceiving /opt/data-receiving-2/
-echo "RECEIVER__PORT=5001" | sudo tee /opt/data-receiving-2/.env
+sudo mkdir -p /opt/data-receiving-2
+sudo cp -r /opt/data-receiving/. /opt/data-receiving-2/
+sudo sed -i 's/RECEIVER__PORT=5000/RECEIVER__PORT=5001/' \
+  /etc/systemd/system/data-receiving-2.service
 sudo chown -R data-receiving:data-receiving /opt/data-receiving-2
 ```
 
@@ -260,24 +378,24 @@ sudo systemctl enable --now data-receiving-2
 # Normal run — 100 frames
 python sender/sender.py --host 127.0.0.1 --port 5000 --count 100
 
-# Corrupt-CRC test (CA-3) — ACK 0x01, frame goes to dlx/
+# Corrupt-CRC test — ACK 0x01, frame goes to dlx/
 python sender/sender.py --corrupt crc
 
-# Schema violation test (CA-4) — ACK 0x03
+# Schema violation test — ACK 0x03
 python sender/sender.py --corrupt schema
 
-# Unknown type test (CA-5) — ACK 0x04
+# Unknown type test — ACK 0x04
 python sender/sender.py --corrupt type
 
-# Throughput test (CA-8) — 1000 frames, no rate limit
+# Throughput test — 1000 frames, no rate limit
 python sender/sender.py --count 1000 --rate 0
 ```
 
 Inspect rejected frames:
 
 ```bash
-ls /opt/data-receiving/dlx/
-cat /opt/data-receiving/dlx/<filename>.json
+ls /var/log/data-receiving/dlx/
+cat /var/log/data-receiving/dlx/<filename>.json
 ```
 
 ---
@@ -285,18 +403,46 @@ cat /opt/data-receiving/dlx/<filename>.json
 ## Architecture
 
 ```
-TCP stream
-    └── FrameReader         reads length-prefixed binary frames
-            └── DtuPacketParser
-                    ├── FrameValidator    sync bytes / VER / TYPE / LEN / CRC
-                    ├── EnvelopeDecoder   MSG_ID / project_id / sensor_id / timestamp / sampling_interval
-                    ├── *PayloadDecoder   one per sensor type (GNSS / Rainfall / Strain / Soil / Deep)
-                    └── SchemaValidator   Draft 2020-12 against embedded JSON schemas
-            └── ISink        StdoutSink | FileSink | NullSink
-            └── LocalDlxWriter   rejected frames → dlx/*.json
+DTU sender (TCP)
+    │
+    ▼
+FrameReader            reads length-prefixed binary frames from the TCP stream
+    │
+    ▼
+DtuPacketParser
+    ├── FrameValidator      sync bytes / VER / TYPE / LEN / CRC-16
+    ├── EnvelopeDecoder     message_id / project_id / sensor_id / timestamp / sampling_interval
+    ├── *PayloadDecoder     one per sensor type (GNSS / Rainfall / Strain / Soil / Deep)
+    └── SchemaValidator     Draft 2020-12 against embedded JSON schemas
+    │
+    ▼
+RabbitMqSink  (when OutputMode=rabbitmq)
+    │
+    ├─1─► RedisMessageBuffer.SetAsync     persist to Redis before touching RabbitMQ
+    │         key: sensor_buffer:{message_id}   TTL: 24h
+    │
+    ├─2─► RabbitMqPublisher.PublishJsonAsync
+    │         exchange: sensors.raw
+    │         routing key: sensors.{project_id}.{sensor_type}
+    │         delivery_mode: 2 (persistent)
+    │         Publisher Confirms — waits for broker ACK
+    │
+    └─3─► RedisMessageBuffer.DeleteAsync  only if broker confirmed
+              if publish failed: message stays in Redis for RetryWorker
+    │
+    ▼
+RetryWorker  (BackgroundService, every 30s)
+    │  scans sensor_buffer:* keys older than 2 min
+    │  retries PublishJsonAsync for each
+    └──────────────────────────────────────────────
+
+ACK → DTU sender
+LocalDlxWriter → /var/log/data-receiving/dlx/*.json   (rejected frames only)
 ```
 
-The parser (`IDtuPacketParser.Parse`) takes `ReadOnlySpan<byte>` and has no dependency on sockets. All 62 tests use hardcoded byte arrays with no network mocks.
+Other output modes (`StdoutSink`, `FileSink`, `NullSink`) bypass Redis and RabbitMQ entirely and are used for local development and testing.
+
+The parser (`IDtuPacketParser.Parse`) takes `ReadOnlySpan<byte>` and has no dependency on sockets or external services. All 62 parser tests use hardcoded byte arrays.
 
 JSON schemas (`envelope.schema.json` + five `payload-*.schema.json`) are compiled into the assembly as embedded resources — no extra files needed at runtime.
 
