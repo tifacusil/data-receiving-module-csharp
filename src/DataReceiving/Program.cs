@@ -1,9 +1,11 @@
+using Consul;
 using DataReceiving.Buffer;
 using DataReceiving.Configuration;
 using DataReceiving.DeadLetter;
 using DataReceiving.Messaging;
 using DataReceiving.Networking;
 using DataReceiving.Parsing;
+using DataReceiving.ServiceDiscovery;
 using DataReceiving.Sinks;
 using DataReceiving.Validation;
 using Microsoft.Extensions.DependencyInjection;
@@ -28,6 +30,8 @@ var host = Host.CreateDefaultBuilder(args)
         });
 
         var outputMode = ctx.Configuration["Receiver:OutputMode"] ?? "stdout";
+
+        services.AddSingleton<TcpServerStatus>();
 
         if (outputMode == "rabbitmq")
         {
@@ -63,6 +67,19 @@ var host = Host.CreateDefaultBuilder(args)
             services.AddSingleton<IMessagePublisher, RabbitMqPublisher>();
             services.AddSingleton<RabbitMqSink>();
             services.AddHostedService<RetryWorker>();
+
+            services.AddSingleton<IConsulClient>(sp =>
+            {
+                var opts = sp.GetRequiredService<IOptions<ReceiverOptions>>().Value.Consul;
+                return new ConsulClient(cfg =>
+                {
+                    cfg.Address = new Uri(opts.Address);
+                    if (!string.IsNullOrEmpty(opts.Token))
+                        cfg.Token = opts.Token;
+                });
+            });
+            services.AddHostedService<HealthEndpoint>();
+            services.AddHostedService<ConsulRegistration>();
         }
 
         services.AddSingleton<StdoutSink>();
@@ -94,7 +111,9 @@ var host = Host.CreateDefaultBuilder(args)
             var dlx = sp.GetRequiredService<LocalDlxWriter>();
             return new TcpServer(opts.Port, parser, sink, dlx, logger);
         });
-        services.AddHostedService<TcpServerHostedService>();
+        services.AddHostedService(sp => new TcpServerHostedService(
+            sp.GetRequiredService<TcpServer>(),
+            sp.GetRequiredService<TcpServerStatus>()));
     })
     .Build();
 

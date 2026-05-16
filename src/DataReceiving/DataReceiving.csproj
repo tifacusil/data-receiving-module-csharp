@@ -15,6 +15,7 @@
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="8.0.1" />
 
     <!-- External broker/cache clients -->
+    <PackageReference Include="Consul" Version="1.7.14.6" />
     <PackageReference Include="RabbitMQ.Client" Version="6.8.1" />
     <PackageReference Include="StackExchange.Redis" Version="2.8.0" />
   </ItemGroup>

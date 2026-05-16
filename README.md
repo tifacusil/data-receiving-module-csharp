@@ -1,8 +1,8 @@
 # Data Receiving Module (C#)
 
-Parser + publisher microservice for the landslide monitoring system described in Bai et al. (2020). Receives binary DTU frames over TCP, validates them, produces JSON envelopes, and publishes them to RabbitMQ with Redis as a durability buffer.
+Parser + publisher microservice for the landslide monitoring system described in Bai et al. (2020). Receives binary DTU frames over TCP, validates them, produces JSON envelopes, publishes them to RabbitMQ with Redis as a durability buffer, and registers itself in Consul for service discovery.
 
-Implements **Card 2A1** (parser + TCP server) and **Card 2A2** (Redis buffer + RabbitMQ publishing). Consul registration (2A3) is not included here.
+Implements **Card 2A1** (parser + TCP server), **Card 2A2** (Redis buffer + RabbitMQ publishing), and **Card 2A3** (Consul service registration + health check).
 
 ---
 
@@ -13,13 +13,14 @@ Implements **Card 2A1** (parser + TCP server) and **Card 2A2** (Redis buffer + R
 3. [Wave 1 infrastructure](#wave-1-infrastructure)
 4. [RabbitMQ topology](#rabbitmq-topology)
 5. [Redis buffer](#redis-buffer)
-6. [Deploying to Linux (Ubuntu 24.04)](#deploying-to-linux-ubuntu-2404)
-7. [Managing the service](#managing-the-service)
-8. [Running multiple instances](#running-multiple-instances)
-9. [Running with the Python sender](#running-with-the-python-sender)
-10. [Architecture](#architecture)
-11. [Sensor types](#sensor-types)
-12. [Dead letter format](#dead-letter-format)
+6. [Consul service registration](#consul-service-registration)
+7. [Deploying to Linux (Ubuntu 24.04)](#deploying-to-linux-ubuntu-2404)
+8. [Managing the service](#managing-the-service)
+9. [Running multiple instances](#running-multiple-instances)
+10. [Running with the Python sender](#running-with-the-python-sender)
+11. [Architecture](#architecture)
+12. [Sensor types](#sensor-types)
+13. [Dead letter format](#dead-letter-format)
 
 ---
 
@@ -31,21 +32,17 @@ Implements **Card 2A1** (parser + TCP server) and **Card 2A2** (Redis buffer + R
 # Build
 dotnet build DataReceiving.sln
 
-# Test — 62 parser tests run locally with no external services
-# 13 additional tests (Redis + RabbitMQ) run in CI
+# Test — 76 tests run locally with no external services; ~102 run in CI
 dotnet test DataReceiving.sln
 
-# Run locally in stdout mode (no Redis/RabbitMQ needed)
+# Run locally in stdout mode (no external services needed)
 dotnet run --project src/DataReceiving
 
-# Run locally in rabbitmq mode (requires Wave 1 infra reachable)
-RECEIVER__OUTPUTMODE=rabbitmq \
-RECEIVER__REDIS__CONNECTIONSTRING="204.168.203.32:6379,password=<Redis password>" \
-RECEIVER__RABBITMQ__HOST=204.168.203.32 \
-RECEIVER__RABBITMQ__USERNAME=data-receiver \
-RECEIVER__RABBITMQ__PASSWORD=<RabbitMQ password> \
-dotnet run --project src/DataReceiving
+# Run locally against Wave 1 infra — load credentials from .env (gitignored)
+source .env && dotnet run --project src/DataReceiving
 ```
+
+The `.env` file is gitignored and holds real Wave 1 credentials. Copy `deploy/.env.example` as a starting point and fill in the secrets. The `source .env` command exports all `RECEIVER__*` env vars into the current shell before `dotnet run` picks them up.
 
 ---
 
@@ -87,6 +84,19 @@ Setting `OutputMode=rabbitmq` activates the Redis buffer and RabbitMQ publisher.
 
 > **Password rule:** `RECEIVER__RABBITMQ__PASSWORD` must never appear in `.env` or any file tracked by git. It belongs exclusively in `/etc/data-receiving/secrets` (permissions `640`, owner `root:data-receiving`).
 
+### Consul (required when `OutputMode=rabbitmq`)
+
+| Env var | Wave 1 value | Description |
+|---|---|---|
+| `RECEIVER__CONSUL__ADDRESS` | `http://204.168.203.32:8500` | Consul agent address |
+| `RECEIVER__CONSUL__TOKEN` | *(secrets file only)* | ACL token — never commit |
+| `RECEIVER__CONSUL__INSTANCEID` | `data-receiving-01` | Unique ID for this instance (`01` / `02` / `03`) |
+| `RECEIVER__CONSUL__HEALTHPORT` | `8080` | Port the embedded health endpoint listens on |
+| `RECEIVER__CONSUL__SERVICEVERSION` | `1.0.0` | Service version tag |
+| `RECEIVER__CONSUL__ENVIRONMENT` | `prod` | Environment tag (`prod`, `staging`, etc.) |
+
+> **Token rule:** `RECEIVER__CONSUL__TOKEN` must never appear in `.env` or any file tracked by git. It belongs exclusively in `/etc/data-receiving/secrets`.
+
 ---
 
 ## Wave 1 infrastructure
@@ -98,7 +108,7 @@ All external services run on a single Wave 1 server. Credentials are stored only
 | RabbitMQ AMQP | `204.168.203.32` | `5672` | User: `data-receiver` |
 | RabbitMQ Management UI | `204.168.203.32` | `15672` | `http://204.168.203.32:15672` |
 | Redis | `204.168.203.32` | `6379` | Password required — include in connection string |
-| Consul | `204.168.203.32` | `8500` | Used by Card 2A3 (not implemented here) |
+| Consul | `204.168.203.32` | `8500` | Service discovery — token in secrets file |
 
 Verify connectivity before deploying:
 
@@ -111,6 +121,9 @@ nc -z -w3 204.168.203.32 5672 && echo "RabbitMQ OK"
 
 # RabbitMQ Management (replace <user> and <pass>)
 curl -s -u '<user>:<pass>' http://204.168.203.32:15672/api/overview | python3 -m json.tool | grep rabbitmq_version
+
+# Consul (replace <token>)
+curl -s -H "X-Consul-Token: <token>" http://204.168.203.32:8500/v1/agent/self | python3 -m json.tool | grep "\"Version\""
 ```
 
 ---
@@ -185,6 +198,35 @@ redis-cli -h 204.168.203.32 -p 6379 -a '<pass>' --no-auth-warning \
 
 ---
 
+## Consul service registration
+
+When `OutputMode=rabbitmq`, the service registers itself with Consul on startup and deregisters cleanly on shutdown.
+
+**Service name:** `data-receiving`
+
+**Service ID:** `data-receiving-{InstanceId}` (e.g. `data-receiving-data-receiving-01`)
+
+**Tags:** `prod`, `version:1.0.0`, `instance:data-receiving-01` (all configurable)
+
+**Health check:** HTTP GET to `http://localhost:{HealthPort}/health/` every 10 seconds. Returns `200 {"status":"ok"}` once the TCP server is listening, `503 {"status":"starting"}` before that. Consul deregisters the service automatically if it stays critical for 1 minute.
+
+The health endpoint (`HealthEndpoint`) is a separate `BackgroundService` that runs an embedded `HttpListener` on port 8080 — no extra dependency or web framework needed.
+
+Verify registration after deploy:
+
+```bash
+# List all registered data-receiving instances
+curl -s http://204.168.203.32:8500/v1/catalog/service/data-receiving | python3 -m json.tool
+
+# Check health status on the agent
+curl -s http://204.168.203.32:8500/v1/health/service/data-receiving | python3 -m json.tool
+
+# Hit the health endpoint directly on the service host
+curl -sv http://<service-host>:8080/health/
+```
+
+---
+
 ## Deploying to Linux (Ubuntu 24.04)
 
 ### Option A — via GitHub Actions (recommended)
@@ -204,16 +246,22 @@ scp data-receiving-linux-x64.zip user@your-server:~
 ```bash
 unzip data-receiving-linux-x64.zip -d release
 sudo RABBITMQ_PASSWORD="<RabbitMQ password>" \
-     REDIS_HOST="204.168.203.32" \
-     RABBITMQ_HOST="204.168.203.32" \
-     bash release/deploy/install.sh
+     CONSUL_TOKEN="<Consul token>" \
+     bash release/deploy/install.sh \
+       --instance 01 \
+       --redis-host 204.168.203.32 \
+       --rabbitmq-host 204.168.203.32 \
+       --consul-host 204.168.203.32
 ```
+
+Replace `--instance 01` with `02` or `03` for the second and third server.
 
 4. Start and verify:
 
 ```bash
 sudo systemctl start data-receiving
 sudo journalctl -u data-receiving -f
+curl http://localhost:8080/health/
 ```
 
 ---
@@ -239,9 +287,12 @@ On the server:
 ```bash
 cd ~/data-receiving-release
 sudo RABBITMQ_PASSWORD="<RabbitMQ password>" \
-     REDIS_HOST="204.168.203.32" \
-     RABBITMQ_HOST="204.168.203.32" \
-     bash deploy/install.sh
+     CONSUL_TOKEN="<Consul token>" \
+     bash deploy/install.sh \
+       --instance 01 \
+       --redis-host 204.168.203.32 \
+       --rabbitmq-host 204.168.203.32 \
+       --consul-host 204.168.203.32
 sudo systemctl start data-receiving
 ```
 
@@ -249,13 +300,25 @@ sudo systemctl start data-receiving
 
 ### What the installer does
 
-`deploy/install.sh` (requires root, reads `RABBITMQ_PASSWORD`, `REDIS_HOST`, `RABBITMQ_HOST`):
+`deploy/install.sh` (requires root):
+
+| Flag | Env var | Description |
+|---|---|---|
+| `--instance <id>` | — | Instance ID appended to Consul service ID (`01`/`02`/`03`) |
+| `--redis-host <h>` | — | Redis host (default: `localhost`) |
+| `--rabbitmq-host <h>` | — | RabbitMQ host (default: `localhost`) |
+| `--consul-host <h>` | — | Consul host (default: `localhost`) |
+| — | `RABBITMQ_PASSWORD` | **Required** — written to secrets file |
+| — | `REDIS_PASSWORD` | Optional — appended to secrets file if set |
+| — | `CONSUL_TOKEN` | Optional — appended to secrets file if set |
+
+Steps performed:
 
 1. Creates system user `data-receiving` (no shell, no home).
 2. Copies the self-contained binary to `/opt/data-receiving/`.
 3. Creates `/var/log/data-receiving/dlx/`.
-4. Writes `/etc/data-receiving/secrets` containing only `RECEIVER__RABBITMQ__PASSWORD` — permissions `640`, owner `root:data-receiving`.
-5. Substitutes `<redis-host>` and `<rabbitmq-host>` placeholders in `deploy/data-receiving.service` and installs it to `/etc/systemd/system/`.
+4. Writes `/etc/data-receiving/secrets` with credentials — permissions `640`, owner `root:data-receiving`.
+5. Substitutes host and instance placeholders in `deploy/data-receiving.service` and installs it to `/etc/systemd/system/`.
 6. Runs `systemctl daemon-reload`, enables and restarts the service.
 
 The installer is idempotent: running it again updates the binary and unit file without touching secrets.
@@ -264,22 +327,23 @@ The installer is idempotent: running it again updates the binary and unit file w
 
 ### Secrets file
 
-`/etc/data-receiving/secrets` is the only file that holds a credential. It is created by `install.sh` and never tracked by git:
+`/etc/data-receiving/secrets` is the only file that holds credentials. It is created by `install.sh` and never tracked by git:
 
 ```
 RECEIVER__RABBITMQ__PASSWORD=<RabbitMQ password>
+RECEIVER__REDIS__CONNECTIONSTRING=204.168.203.32:6379,password=<Redis password>
+RECEIVER__CONSUL__TOKEN=<Consul token>
 ```
 
-The systemd unit reads it via `EnvironmentFile=/etc/data-receiving/secrets`. All other configuration lives in the `Environment=` directives inside the unit file itself (host, port, username, exchange, etc. — nothing sensitive).
-
----
+The systemd unit reads it via `EnvironmentFile=/etc/data-receiving/secrets`. All other configuration lives in the `Environment=` directives inside the unit file itself (hosts, ports, usernames, exchange, instance ID, etc. — nothing sensitive).
 
 ### Firewall
 
-If `ufw` is active, open the TCP port the service listens on:
+If `ufw` is active, open the TCP listener port and the health endpoint port:
 
 ```bash
-sudo ufw allow 5000/tcp
+sudo ufw allow 5000/tcp   # DTU sensors
+sudo ufw allow 8080/tcp   # Consul health checks (only from Consul agent)
 sudo ufw status
 ```
 
@@ -438,6 +502,17 @@ RetryWorker  (BackgroundService, every 30s)
 
 ACK → DTU sender
 LocalDlxWriter → /var/log/data-receiving/dlx/*.json   (rejected frames only)
+
+Side services (when OutputMode=rabbitmq):
+
+HealthEndpoint  (BackgroundService, HttpListener on :8080)
+    │  GET /health/ → 200 {"status":"ok"}   when TCP server is listening
+    │              → 503 {"status":"starting"} while starting up
+    └── read-only access to TcpServerStatus singleton
+
+ConsulRegistration  (IHostedService)
+    │  StartAsync → Agent.ServiceRegister(data-receiving, tags, HTTP health check)
+    └── StopAsync  → Agent.ServiceDeregister(service-id)
 ```
 
 Other output modes (`StdoutSink`, `FileSink`, `NullSink`) bypass Redis and RabbitMQ entirely and are used for local development and testing.
