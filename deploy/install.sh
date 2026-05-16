@@ -18,6 +18,7 @@ fi
 
 # --- Required env vars ---
 : "${RABBITMQ_PASSWORD:?Set RABBITMQ_PASSWORD before running}"
+: "${REDIS_PASSWORD:?Set REDIS_PASSWORD before running}"
 
 # --- Default flag values ---
 INSTANCE_ID=""
@@ -57,6 +58,8 @@ fi
 mkdir -p "$INSTALL_DIR" "$LOG_DIR/dlx" "$SECRETS_DIR"
 chown -R "$SERVICE:$SERVICE" "$INSTALL_DIR" "$LOG_DIR"
 chmod 750 "$INSTALL_DIR" "$LOG_DIR"
+chown root:"$SERVICE" "$SECRETS_DIR"
+chmod 750 "$SECRETS_DIR"
 
 # --- Binary ---
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -76,12 +79,9 @@ echo "==> Binary installed at $INSTALL_DIR"
 # --- Secrets file (passwords/tokens only, strict permissions) ---
 cat > "$SECRETS_FILE" <<EOF
 RECEIVER__RABBITMQ__PASSWORD=${RABBITMQ_PASSWORD}
+RECEIVER__REDIS__CONNECTIONSTRING=${REDIS_HOST}:6379,password=${REDIS_PASSWORD}
 EOF
 
-# Append optional secrets
-if [[ -n "${REDIS_PASSWORD:-}" ]]; then
-  echo "RECEIVER__REDIS__CONNECTIONSTRING=${REDIS_HOST}:6379,password=${REDIS_PASSWORD}" >> "$SECRETS_FILE"
-fi
 if [[ -n "${CONSUL_TOKEN:-}" ]]; then
   echo "RECEIVER__CONSUL__TOKEN=${CONSUL_TOKEN}" >> "$SECRETS_FILE"
 fi

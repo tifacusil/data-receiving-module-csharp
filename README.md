@@ -82,7 +82,7 @@ Setting `OutputMode=rabbitmq` activates the Redis buffer and RabbitMQ publisher.
 | `RECEIVER__RABBITMQ__EXCHANGE` | `sensors.raw` | Topic exchange declared by Wave 1 |
 | `RECEIVER__RABBITMQ__CONFIRMTIMEOUTSECONDS` | `5` | Publisher Confirms timeout |
 
-> **Password rule:** `RECEIVER__RABBITMQ__PASSWORD` must never appear in `.env` or any file tracked by git. It belongs exclusively in `/etc/data-receiving/secrets` (permissions `640`, owner `root:data-receiving`).
+> **Password rule:** `RECEIVER__RABBITMQ__PASSWORD` must never be committed to git. For local dev it can live in `.env` (gitignored). On servers it belongs exclusively in `/etc/data-receiving/secrets` (permissions `640`, owner `root:data-receiving`).
 
 ### Consul (required when `OutputMode=rabbitmq`)
 
@@ -95,7 +95,7 @@ Setting `OutputMode=rabbitmq` activates the Redis buffer and RabbitMQ publisher.
 | `RECEIVER__CONSUL__SERVICEVERSION` | `1.0.0` | Service version tag |
 | `RECEIVER__CONSUL__ENVIRONMENT` | `prod` | Environment tag (`prod`, `staging`, etc.) |
 
-> **Token rule:** `RECEIVER__CONSUL__TOKEN` must never appear in `.env` or any file tracked by git. It belongs exclusively in `/etc/data-receiving/secrets`.
+> **Token rule:** `RECEIVER__CONSUL__TOKEN` must never be committed to git. For local dev it can live in `.env` (gitignored). On servers it belongs exclusively in `/etc/data-receiving/secrets`.
 
 ---
 
@@ -246,6 +246,7 @@ scp data-receiving-linux-x64.zip user@your-server:~
 ```bash
 unzip data-receiving-linux-x64.zip -d release
 sudo RABBITMQ_PASSWORD="<RabbitMQ password>" \
+     REDIS_PASSWORD="<Redis password>" \
      CONSUL_TOKEN="<Consul token>" \
      bash release/deploy/install.sh \
        --instance 01 \
@@ -287,6 +288,7 @@ On the server:
 ```bash
 cd ~/data-receiving-release
 sudo RABBITMQ_PASSWORD="<RabbitMQ password>" \
+     REDIS_PASSWORD="<Redis password>" \
      CONSUL_TOKEN="<Consul token>" \
      bash deploy/install.sh \
        --instance 01 \
@@ -309,7 +311,7 @@ sudo systemctl start data-receiving
 | `--rabbitmq-host <h>` | — | RabbitMQ host (default: `localhost`) |
 | `--consul-host <h>` | — | Consul host (default: `localhost`) |
 | — | `RABBITMQ_PASSWORD` | **Required** — written to secrets file |
-| — | `REDIS_PASSWORD` | Optional — appended to secrets file if set |
+| — | `REDIS_PASSWORD` | **Required** — written to secrets file as full connection string |
 | — | `CONSUL_TOKEN` | Optional — appended to secrets file if set |
 
 Steps performed:
@@ -331,7 +333,7 @@ The installer is idempotent: running it again updates the binary and unit file w
 
 ```
 RECEIVER__RABBITMQ__PASSWORD=<RabbitMQ password>
-RECEIVER__REDIS__CONNECTIONSTRING=204.168.203.32:6379,password=<Redis password>
+RECEIVER__REDIS__CONNECTIONSTRING=<redis-host>:6379,password=<Redis password>
 RECEIVER__CONSUL__TOKEN=<Consul token>
 ```
 
@@ -398,40 +400,56 @@ redis-cli -h 204.168.203.32 -p 6379 -a '<pass>' --no-auth-warning \
 
 ## Running multiple instances
 
-The paper (Bai et al., Table 2) deploys three instances across heterogeneous hardware. Each instance is an independent process on its own host, listening on the same port. All instances publish to the same RabbitMQ exchange — the broker handles fan-out.
+The paper (Bai et al., Table 2) deploys three instances across heterogeneous hardware. The normal deployment is **one instance per physical server** — each server runs `install.sh` with its own `--instance` ID and all instances publish to the same RabbitMQ exchange.
 
-To run two instances on the **same host** (e.g. for testing):
+```bash
+# Server 1
+sudo ... bash install.sh --instance 01 --redis-host 204.168.203.32 ...
 
-1. Copy the service file:
+# Server 2
+sudo ... bash install.sh --instance 02 --redis-host 204.168.203.32 ...
+
+# Server 3
+sudo ... bash install.sh --instance 03 --redis-host 204.168.203.32 ...
+```
+
+Each instance registers in Consul under a unique service ID (`data-receiving-data-receiving-01`, `02`, `03`), so Consul sees all three.
+
+### Two instances on the same host (testing only)
+
+Three things conflict and must be different: **TCP port**, **health endpoint port**, and **Consul instance ID**.
+
+1. Install instance 01 normally (TCP `5000`, health `8080`).
+
+2. Build a second unit file for instance 02:
 
 ```bash
 sudo cp /etc/systemd/system/data-receiving.service \
         /etc/systemd/system/data-receiving-2.service
-```
-
-2. Edit `data-receiving-2.service` — change `ExecStart`, `WorkingDirectory`, and `SyslogIdentifier`:
-
-```ini
-WorkingDirectory=/opt/data-receiving-2
-ExecStart=/opt/data-receiving-2/DataReceiving
-SyslogIdentifier=data-receiving-2
-```
-
-3. Create the second directory with a different port:
-
-```bash
-sudo mkdir -p /opt/data-receiving-2
-sudo cp -r /opt/data-receiving/. /opt/data-receiving-2/
-sudo sed -i 's/RECEIVER__PORT=5000/RECEIVER__PORT=5001/' \
+sudo sed -i \
+  -e 's|ExecStart=/opt/data-receiving/|ExecStart=/opt/data-receiving-2/|' \
+  -e 's|WorkingDirectory=/opt/data-receiving|WorkingDirectory=/opt/data-receiving-2|' \
+  -e 's|SyslogIdentifier=data-receiving|SyslogIdentifier=data-receiving-2|' \
+  -e 's|RECEIVER__PORT=5000|RECEIVER__PORT=5001|' \
+  -e 's|RECEIVER__CONSUL__HEALTHPORT=8080|RECEIVER__CONSUL__HEALTHPORT=8081|' \
+  -e 's|RECEIVER__CONSUL__INSTANCEID=data-receiving-01|RECEIVER__CONSUL__INSTANCEID=data-receiving-02|' \
   /etc/systemd/system/data-receiving-2.service
-sudo chown -R data-receiving:data-receiving /opt/data-receiving-2
 ```
 
-4. Enable and start:
+3. Copy the binary and start:
 
 ```bash
+sudo cp -r /opt/data-receiving/. /opt/data-receiving-2/
+sudo chown -R data-receiving:data-receiving /opt/data-receiving-2
 sudo systemctl daemon-reload
 sudo systemctl enable --now data-receiving-2
+```
+
+4. Open the extra ports:
+
+```bash
+sudo ufw allow 5001/tcp
+sudo ufw allow 8081/tcp
 ```
 
 ---
