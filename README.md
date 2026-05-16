@@ -39,27 +39,39 @@ dotnet run --project src/DataReceiving
 
 ## Configuration
 
-All settings live in `appsettings.json` and can be overridden by environment variables using the `RECEIVER__` prefix (double underscore). Environment variables always win over the file.
+All settings live in `appsettings.json` and can be overridden by environment variables. The convention is `RECEIVER__` prefix with double underscores as section separators (`RECEIVER__REDIS__CONNECTIONSTRING`, etc.). Environment variables always win over the file.
 
-```json
-{
-  "Receiver": {
-    "Port": 5000,
-    "DlxPath": "./dlx",
-    "OutputMode": "stdout",
-    "OutputFilePath": "./output"
-  }
-}
-```
+### Core settings
 
-| Key | Default | Description |
+| Env var | Default | Description |
 |---|---|---|
-| `Port` | `5000` | TCP port the server listens on |
-| `DlxPath` | `./dlx` | Directory where rejected frames are written |
-| `OutputMode` | `stdout` | `stdout` · `file` · `null` |
-| `OutputFilePath` | `./output` | Directory for JSON files when `OutputMode=file` |
+| `RECEIVER__PORT` | `5000` | TCP port the server listens on |
+| `RECEIVER__DLXPATH` | `./dlx` | Directory where rejected frames are written |
+| `RECEIVER__OUTPUTMODE` | `stdout` | `stdout` · `file` · `null` · `rabbitmq` |
+| `RECEIVER__OUTPUTFILEPATH` | `./output` | Directory for JSON files when `OutputMode=file` |
 
-Environment variable names: `RECEIVER__PORT`, `RECEIVER__DLXPATH`, `RECEIVER__OUTPUTMODE`, `RECEIVER__OUTPUTFILEPATH`.
+### Redis (required when `OutputMode=rabbitmq`)
+
+| Env var | Wave 1 value | Description |
+|---|---|---|
+| `RECEIVER__REDIS__CONNECTIONSTRING` | `204.168.203.32:6379,password=<Redis password>` | StackExchange.Redis connection string |
+| `RECEIVER__REDIS__BUFFERTLTHOURS` | `24` | How long a message stays buffered if RabbitMQ is down |
+| `RECEIVER__REDIS__RETRYINTERVALSECONDS` | `30` | How often RetryWorker scans for unsent messages |
+| `RECEIVER__REDIS__RETRYMINAGEMINUTES` | `2` | Minimum age before RetryWorker retries a buffered message |
+
+### RabbitMQ (required when `OutputMode=rabbitmq`)
+
+| Env var | Wave 1 value | Description |
+|---|---|---|
+| `RECEIVER__RABBITMQ__HOST` | `204.168.203.32` | Broker hostname or IP |
+| `RECEIVER__RABBITMQ__PORT` | `5672` | AMQP port |
+| `RECEIVER__RABBITMQ__VIRTUALHOST` | `/` | Virtual host |
+| `RECEIVER__RABBITMQ__USERNAME` | `data-receiver` | AMQP user |
+| `RECEIVER__RABBITMQ__PASSWORD` | *(secrets file)* | Never commit — set in `/etc/data-receiving/secrets` |
+| `RECEIVER__RABBITMQ__EXCHANGE` | `sensors.raw` | Topic exchange (declared by Wave 1) |
+| `RECEIVER__RABBITMQ__CONFIRMTIMEOUTSECONDS` | `5` | Timeout for Publisher Confirms |
+
+> **Password rule:** `RECEIVER__RABBITMQ__PASSWORD` must never go into `.env` or any file tracked by git. It belongs exclusively in `/etc/data-receiving/secrets` (permissions `640`, owner `root:data-receiving`).
 
 ---
 

@@ -8,14 +8,15 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- Schema validation -->
     <PackageReference Include="JsonSchema.Net" Version="7.3.2" />
-    <PackageReference Include="Microsoft.Extensions.Logging" Version="8.0.1" />
-    <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="8.0.1" />
-    <PackageReference Include="Microsoft.Extensions.Configuration" Version="8.0.0" />
-    <PackageReference Include="Microsoft.Extensions.Configuration.Json" Version="8.0.0" />
-    <PackageReference Include="Microsoft.Extensions.Configuration.EnvironmentVariables" Version="8.0.0" />
-    <PackageReference Include="Microsoft.Extensions.Options.ConfigurationExtensions" Version="8.0.0" />
-    <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="8.0.1" />
+
+    <!-- Hosting — pulls in DI, Logging, Configuration, Options transitively -->
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="8.0.1" />
+
+    <!-- External broker/cache clients -->
+    <PackageReference Include="RabbitMQ.Client" Version="6.8.1" />
+    <PackageReference Include="StackExchange.Redis" Version="2.8.0" />
   </ItemGroup>
 
   <ItemGroup>
@@ -28,6 +29,11 @@
     <None Update="appsettings.json">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="DataReceiving.UnitTests" />
+    <InternalsVisibleTo Include="DataReceiving.IntegrationTests" />
   </ItemGroup>
 
 </Project>

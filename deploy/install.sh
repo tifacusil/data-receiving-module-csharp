@@ -1,35 +1,76 @@
 #!/usr/bin/env bash
+# install.sh — installs Data Receiving on Ubuntu 24.04 LTS.
+# Usage: sudo RABBITMQ_PASSWORD=<pass> REDIS_HOST=<host> RABBITMQ_HOST=<host> bash install.sh
 set -euo pipefail
 
-DEPLOY_DIR=/opt/data-receiving
-SERVICE=data-receiving
-BINARY_DIR="$(cd "$(dirname "$0")/../publish" && pwd)"
+INSTALL_DIR="/opt/data-receiving"
+LOG_DIR="/var/log/data-receiving"
+SECRETS_DIR="/etc/data-receiving"
+SECRETS_FILE="$SECRETS_DIR/secrets"
+SERVICE="data-receiving"
+SERVICE_FILE="/etc/systemd/system/$SERVICE.service"
 
-echo "==> Creating system user"
-id "$SERVICE" &>/dev/null || useradd --system --no-create-home --shell /usr/sbin/nologin "$SERVICE"
-
-echo "==> Installing binary to $DEPLOY_DIR"
-mkdir -p "$DEPLOY_DIR"/{dlx,output}
-cp -r "$BINARY_DIR"/. "$DEPLOY_DIR"/
-chown -R "$SERVICE":"$SERVICE" "$DEPLOY_DIR"
-chmod 750 "$DEPLOY_DIR"
-chmod 755 "$DEPLOY_DIR/DataReceiving"
-
-echo "==> Installing .env (skipped if already exists)"
-if [ ! -f "$DEPLOY_DIR/.env" ]; then
-    cp "$(dirname "$0")/.env.example" "$DEPLOY_DIR/.env"
-    chmod 640 "$DEPLOY_DIR/.env"
-    chown "$SERVICE":"$SERVICE" "$DEPLOY_DIR/.env"
-    echo "    Created $DEPLOY_DIR/.env — edit it before starting the service"
+# --- Verify root ---
+if [[ $EUID -ne 0 ]]; then
+  echo "ERROR: run with sudo"
+  exit 1
 fi
 
-echo "==> Installing systemd unit"
-cp "$(dirname "$0")/$SERVICE.service" /etc/systemd/system/
+# --- Required variables ---
+: "${RABBITMQ_PASSWORD:?Set RABBITMQ_PASSWORD before running}"
+REDIS_HOST="${REDIS_HOST:-localhost}"
+RABBITMQ_HOST="${RABBITMQ_HOST:-localhost}"
+
+echo "==> Installing Data Receiving"
+echo "    Redis:    $REDIS_HOST"
+echo "    RabbitMQ: $RABBITMQ_HOST"
+
+# --- System user ---
+if ! id "$SERVICE" &>/dev/null; then
+  useradd --system --no-create-home --shell /usr/sbin/nologin "$SERVICE"
+  echo "==> Created system user $SERVICE"
+fi
+
+# --- Directories ---
+mkdir -p "$INSTALL_DIR" "$LOG_DIR/dlx" "$SECRETS_DIR"
+chown -R "$SERVICE:$SERVICE" "$INSTALL_DIR" "$LOG_DIR"
+chmod 750 "$INSTALL_DIR" "$LOG_DIR"
+
+# --- Binary ---
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BINARY_SRC="$SCRIPT_DIR/../publish"
+
+if [[ ! -f "$BINARY_SRC/DataReceiving" ]]; then
+  echo "ERROR: binary not found at $BINARY_SRC/DataReceiving"
+  echo "  Build first: dotnet publish src/DataReceiving/DataReceiving.csproj -c Release -r linux-x64 --self-contained true -o publish/"
+  exit 1
+fi
+
+cp -r "$BINARY_SRC/." "$INSTALL_DIR/"
+chown -R "$SERVICE:$SERVICE" "$INSTALL_DIR"
+chmod +x "$INSTALL_DIR/DataReceiving"
+echo "==> Binary installed at $INSTALL_DIR"
+
+# --- Secrets file (password only, strict permissions) ---
+cat > "$SECRETS_FILE" <<EOF
+RECEIVER__RABBITMQ__PASSWORD=${RABBITMQ_PASSWORD}
+EOF
+chown root:"$SERVICE" "$SECRETS_FILE"
+chmod 640 "$SECRETS_FILE"
+echo "==> Secrets written to $SECRETS_FILE"
+
+# --- Systemd unit (substitute host placeholders) ---
+sed \
+  -e "s|<redis-host>|${REDIS_HOST}|g" \
+  -e "s|<rabbitmq-host>|${RABBITMQ_HOST}|g" \
+  "$SCRIPT_DIR/data-receiving.service" > "$SERVICE_FILE"
+
+chmod 644 "$SERVICE_FILE"
 systemctl daemon-reload
 systemctl enable "$SERVICE"
+systemctl restart "$SERVICE"
 
 echo ""
-echo "Done. Next steps:"
-echo "  1. Edit $DEPLOY_DIR/.env"
-echo "  2. sudo systemctl start $SERVICE"
-echo "  3. sudo journalctl -u $SERVICE -f"
+echo "==> Done. Verify with:"
+echo "    systemctl status $SERVICE"
+echo "    journalctl -u $SERVICE -f"

@@ -1,45 +1,101 @@
+using DataReceiving.Buffer;
 using DataReceiving.Configuration;
 using DataReceiving.DeadLetter;
+using DataReceiving.Messaging;
 using DataReceiving.Networking;
 using DataReceiving.Parsing;
 using DataReceiving.Sinks;
 using DataReceiving.Validation;
-using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using RabbitMQ.Client;
+using StackExchange.Redis;
 
-var config = new ConfigurationBuilder()
-    .AddJsonFile("appsettings.json", optional: true)
-    .AddEnvironmentVariables(prefix: "RECEIVER__")
+var host = Host.CreateDefaultBuilder(args)
+    .ConfigureServices((ctx, services) =>
+    {
+        services.Configure<ReceiverOptions>(ctx.Configuration.GetSection("Receiver"));
+
+        services.AddSingleton<SchemaValidator>();
+        services.AddSingleton<IDtuPacketParser, DtuPacketParser>();
+
+        services.AddSingleton<LocalDlxWriter>(sp =>
+        {
+            var opts = sp.GetRequiredService<IOptions<ReceiverOptions>>().Value;
+            return new LocalDlxWriter(opts.DlxPath);
+        });
+
+        var outputMode = ctx.Configuration["Receiver:OutputMode"] ?? "stdout";
+
+        if (outputMode == "rabbitmq")
+        {
+            services.AddSingleton<IConnectionMultiplexer>(sp =>
+            {
+                var opts = sp.GetRequiredService<IOptions<ReceiverOptions>>().Value.Redis;
+                return ConnectionMultiplexer.Connect(opts.ConnectionString);
+            });
+            services.AddSingleton<IMessageBuffer, RedisMessageBuffer>();
+
+            services.AddSingleton<IConnection>(sp =>
+            {
+                var opts = sp.GetRequiredService<IOptions<ReceiverOptions>>().Value.RabbitMq;
+                var factory = new ConnectionFactory
+                {
+                    HostName = opts.Host,
+                    Port = opts.Port,
+                    VirtualHost = opts.VirtualHost,
+                    UserName = opts.Username,
+                    Password = opts.Password,
+                    AutomaticRecoveryEnabled = true,
+                    NetworkRecoveryInterval = TimeSpan.FromSeconds(5),
+                };
+                return factory.CreateConnection("data-receiving");
+            });
+            services.AddSingleton<IModel>(sp =>
+            {
+                var conn = sp.GetRequiredService<IConnection>();
+                var channel = conn.CreateModel();
+                channel.ConfirmSelect();
+                return channel;
+            });
+            services.AddSingleton<IMessagePublisher, RabbitMqPublisher>();
+            services.AddSingleton<RabbitMqSink>();
+            services.AddHostedService<RetryWorker>();
+        }
+
+        services.AddSingleton<StdoutSink>();
+        services.AddSingleton<FileSink>(sp =>
+        {
+            var opts = sp.GetRequiredService<IOptions<ReceiverOptions>>().Value;
+            return new FileSink(opts.OutputFilePath);
+        });
+        services.AddSingleton<NullSink>();
+
+        services.AddSingleton<ISink>(sp =>
+        {
+            var opts = sp.GetRequiredService<IOptions<ReceiverOptions>>().Value;
+            return opts.OutputMode switch
+            {
+                "rabbitmq" => (ISink)sp.GetRequiredService<RabbitMqSink>(),
+                "file"     => sp.GetRequiredService<FileSink>(),
+                "null"     => sp.GetRequiredService<NullSink>(),
+                _          => sp.GetRequiredService<StdoutSink>(),
+            };
+        });
+
+        services.AddSingleton<TcpServer>(sp =>
+        {
+            var opts = sp.GetRequiredService<IOptions<ReceiverOptions>>().Value;
+            var logger = sp.GetRequiredService<ILogger<TcpServer>>();
+            var parser = sp.GetRequiredService<IDtuPacketParser>();
+            var sink = sp.GetRequiredService<ISink>();
+            var dlx = sp.GetRequiredService<LocalDlxWriter>();
+            return new TcpServer(opts.Port, parser, sink, dlx, logger);
+        });
+        services.AddHostedService<TcpServerHostedService>();
+    })
     .Build();
 
-var services = new ServiceCollection();
-services.Configure<ReceiverOptions>(config.GetSection("Receiver"));
-services.AddLogging(b => b
-    .AddConsole()
-    .AddConfiguration(config.GetSection("Logging")));
-services.AddSingleton<SchemaValidator>();
-services.AddSingleton<IDtuPacketParser, DtuPacketParser>();
-
-var provider = services.BuildServiceProvider();
-
-var opts = provider.GetRequiredService<IOptions<ReceiverOptions>>().Value;
-var loggerFactory = provider.GetRequiredService<ILoggerFactory>();
-var logger = loggerFactory.CreateLogger<TcpServer>();
-var parser = provider.GetRequiredService<IDtuPacketParser>();
-
-ISink sink = opts.OutputMode switch
-{
-    "file" => new FileSink(opts.OutputFilePath),
-    "null" => new NullSink(),
-    _ => new StdoutSink(),
-};
-
-var dlx = new LocalDlxWriter(opts.DlxPath);
-var server = new TcpServer(opts.Port, parser, sink, dlx, logger);
-
-using var cts = new CancellationTokenSource();
-Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
-
-await server.RunAsync(cts.Token);
+await host.RunAsync();
