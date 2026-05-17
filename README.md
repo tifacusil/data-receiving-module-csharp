@@ -262,7 +262,7 @@ Replace `--instance 01` with `02` or `03` for the second and third server.
 ```bash
 sudo systemctl start data-receiving
 sudo journalctl -u data-receiving -f
-curl http://localhost:8080/health/
+curl http://localhost:8081/health/   # port 8080 was in use on Wave 1 server; changed to 8081
 ```
 
 ---
@@ -270,6 +270,23 @@ curl http://localhost:8080/health/
 ### Option B — build and deploy manually
 
 On your development machine:
+
+> **Important:** build with .NET installed from the **Microsoft package feed**, not
+> from snap. A snap-installed `dotnet` hardwires the binary to
+> `/snap/core20/current/lib64/ld-linux-x86-64.so.2` as its ELF interpreter —
+> that path does not exist on a standard Ubuntu server, causing a cryptic
+> `No such file or directory` error when systemd tries to execute the binary.
+>
+> Verify your dotnet is not from snap:
+> ```bash
+> which dotnet   # should be /usr/bin/dotnet, not /snap/bin/dotnet
+> ```
+> If it is from snap, install from Microsoft's feed instead:
+> ```bash
+> wget https://packages.microsoft.com/config/ubuntu/24.04/packages-microsoft-prod.deb
+> sudo dpkg -i packages-microsoft-prod.deb
+> sudo apt update && sudo apt install dotnet-sdk-8.0 -y
+> ```
 
 ```bash
 dotnet publish src/DataReceiving/DataReceiving.csproj \
@@ -348,6 +365,73 @@ sudo ufw allow 5000/tcp   # DTU sensors
 sudo ufw allow 8080/tcp   # Consul health checks (only from Consul agent)
 sudo ufw status
 ```
+
+---
+
+## Troubleshooting
+
+### `No such file or directory` when systemd starts the binary
+
+The binary executes fine locally but fails on the server with:
+
+```
+data-receiving.service: Failed to execute /opt/data-receiving/DataReceiving: No such file or directory
+```
+
+**Cause:** the binary was built with a snap-installed `dotnet`, which embeds
+`/snap/core20/current/lib64/ld-linux-x86-64.so.2` as the ELF interpreter.
+That path does not exist on the server.
+
+**Verify:**
+```bash
+file /opt/data-receiving/DataReceiving
+# look for "interpreter /snap/core20/..." in the output
+```
+
+**Fix A (permanent):** rebuild with Microsoft feed `dotnet` (see Option B above).
+
+**Fix B (emergency):** patch the interpreter on the server:
+```bash
+sudo apt install patchelf -y
+sudo patchelf --set-interpreter /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 \
+  /opt/data-receiving/DataReceiving
+sudo systemctl start data-receiving
+```
+
+---
+
+### Health endpoint port already in use
+
+If the service crashes immediately with `Address already in use` on port 8080,
+something else is using that port. Change the health port in the unit file:
+
+```bash
+sudo systemctl stop data-receiving
+sudo nano /etc/systemd/system/data-receiving.service
+# change RECEIVER__CONSUL__HEALTHPORT=8080 to an available port, e.g. 8081
+sudo systemctl daemon-reload
+sudo systemctl start data-receiving
+sudo ufw allow 8081/tcp
+```
+
+Update `docs/consul-setup.md` and the `config.yaml` in the e2e tests to match.
+
+---
+
+### Consul shows service registered but `ServicePort` is the health port
+
+The C# service registers `ServicePort = HealthPort` (e.g. 8081), not the TCP
+data port (5000). This is a known characteristic of the current implementation.
+
+When configuring consul-template to generate Nginx upstreams, derive the TCP
+data port from the health port. For the Wave 1 deployment (health ports
+8081/8082/8083, data ports 5000/5001/5002) the offset is always 3081:
+
+```
+{{ subtract 3081 .Port }}   → gives the TCP data port
+```
+
+See `docs/consul-setup.md` for the full consul-template configuration.
 
 ---
 
