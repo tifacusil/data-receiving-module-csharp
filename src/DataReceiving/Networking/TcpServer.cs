@@ -1,6 +1,8 @@
+using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using DataReceiving.DeadLetter;
+using DataReceiving.Observability;
 using DataReceiving.Parsing;
 using DataReceiving.Sinks;
 using Microsoft.Extensions.Logging;
@@ -14,17 +16,19 @@ public class TcpServer
     private readonly ISink _sink;
     private readonly LocalDlxWriter _dlx;
     private readonly ILogger<TcpServer> _logger;
+    private readonly PipelineMetrics? _metrics;
 
     private long _totalFrames;
     private long _gnssCount, _rainfallCount, _strainCount, _soilCount, _deepCount, _dlxCount;
 
-    public TcpServer(int port, IDtuPacketParser parser, ISink sink, LocalDlxWriter dlx, ILogger<TcpServer> logger)
+    public TcpServer(int port, IDtuPacketParser parser, ISink sink, LocalDlxWriter dlx, ILogger<TcpServer> logger, PipelineMetrics? metrics = null)
     {
         _port = port;
         _parser = parser;
         _sink = sink;
         _dlx = dlx;
         _logger = logger;
+        _metrics = metrics;
     }
 
     public async Task RunAsync(CancellationToken ct)
@@ -70,6 +74,7 @@ public class TcpServer
                     break;
                 }
 
+                var startTs = Stopwatch.GetTimestamp();
                 var result = _parser.Parse(rawFrame);
                 Interlocked.Increment(ref _totalFrames);
 
@@ -81,6 +86,8 @@ public class TcpServer
                         result.Envelope.ProjectId, result.Envelope.MessageId[..8], rawFrame.Length);
 
                     await _sink.WriteAsync(result.Envelope, ct);
+                    _metrics?.IncPublished();
+                    _metrics?.ObserveFrame("ok", result.Envelope.SensorType, Stopwatch.GetElapsedTime(startTs).TotalSeconds);
                     await SendAckAsync(stream, 0x00, 0x00, ct);
                 }
                 else if (result.Error is not null)
@@ -92,6 +99,8 @@ public class TcpServer
                         result.Error.Stage, result.Error.Message, hexPreview);
 
                     await _dlx.WriteAsync(rawFrame, result.Error, ct);
+                    _metrics?.IncDropped();
+                    _metrics?.ObserveFrame("rejected", "unknown", Stopwatch.GetElapsedTime(startTs).TotalSeconds);
                     await SendAckAsync(stream, ackStatus, (byte)result.Error.Stage, ct);
                 }
             }

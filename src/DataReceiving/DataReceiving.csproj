@@ -14,6 +14,9 @@
     <!-- Hosting — pulls in DI, Logging, Configuration, Options transitively -->
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="8.0.1" />
 
+    <!-- Prometheus metrics (mirror del layer observability del rewrite en Go) -->
+    <PackageReference Include="prometheus-net" Version="8.2.1" />
+
     <!-- External broker/cache clients -->
     <PackageReference Include="Consul" Version="1.7.14.6" />
     <PackageReference Include="RabbitMQ.Client" Version="6.8.1" />

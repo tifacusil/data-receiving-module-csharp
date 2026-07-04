@@ -4,6 +4,7 @@ using DataReceiving.Configuration;
 using DataReceiving.DeadLetter;
 using DataReceiving.Messaging;
 using DataReceiving.Networking;
+using DataReceiving.Observability;
 using DataReceiving.Parsing;
 using DataReceiving.ServiceDiscovery;
 using DataReceiving.Sinks;
@@ -19,6 +20,10 @@ var host = Host.CreateDefaultBuilder(args)
     .ConfigureServices((ctx, services) =>
     {
         services.Configure<ReceiverOptions>(ctx.Configuration.GetSection("Receiver"));
+
+        // Métricas del pipeline: se recolectan siempre (cualquier OutputMode);
+        // solo se exponen en /metrics cuando el HealthEndpoint corre (modo rabbitmq).
+        services.AddSingleton<PipelineMetrics>();
 
         services.AddSingleton<SchemaValidator>();
         services.AddSingleton<IDtuPacketParser, DtuPacketParser>();
@@ -109,7 +114,8 @@ var host = Host.CreateDefaultBuilder(args)
             var parser = sp.GetRequiredService<IDtuPacketParser>();
             var sink = sp.GetRequiredService<ISink>();
             var dlx = sp.GetRequiredService<LocalDlxWriter>();
-            return new TcpServer(opts.Port, parser, sink, dlx, logger);
+            var metrics = sp.GetRequiredService<PipelineMetrics>();
+            return new TcpServer(opts.Port, parser, sink, dlx, logger, metrics);
         });
         services.AddHostedService(sp => new TcpServerHostedService(
             sp.GetRequiredService<TcpServer>(),
