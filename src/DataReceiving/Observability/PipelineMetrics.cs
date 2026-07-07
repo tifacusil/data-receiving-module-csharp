@@ -18,6 +18,8 @@ public sealed class PipelineMetrics
     private readonly Histogram _frameLatency;
     private readonly Counter _published;
     private readonly Counter _dropped;
+    private readonly Counter _connectionsTotal;
+    private readonly Gauge _connectionsActive;
 
     public PipelineMetrics()
         : this(Metrics.DefaultRegistry)
@@ -55,6 +57,14 @@ public sealed class PipelineMetrics
             "data_receiving_messages_dropped_total",
             "Frames rejected and written to the dead-letter directory.");
 
+        _connectionsTotal = factory.CreateCounter(
+            "data_receiving_tcp_connections_total",
+            "Total TCP connections accepted by the DTU listener.");
+
+        _connectionsActive = factory.CreateGauge(
+            "data_receiving_tcp_connections_active",
+            "TCP connections (streams) currently open on the DTU listener.");
+
         // prometheus-net expone process_working_set_bytes pero NO
         // process_resident_memory_bytes (el nombre que usa el ProcessCollector de
         // Go). Publicamos un alias con el nombre de Go, con la misma fuente que
@@ -79,6 +89,16 @@ public sealed class PipelineMetrics
 
     /// <summary>Incrementa el contador de frames descartados (dead-letter).</summary>
     public void IncDropped() => _dropped.Inc();
+
+    /// <summary>Marca una conexión TCP abierta: +1 total aceptadas, +1 activas.</summary>
+    public void ConnectionOpened()
+    {
+        _connectionsTotal.Inc();
+        _connectionsActive.Inc();
+    }
+
+    /// <summary>Marca una conexión TCP cerrada: -1 activas.</summary>
+    public void ConnectionClosed() => _connectionsActive.Dec();
 
     /// <summary>Serializa el registro en formato de texto Prometheus 0.0.4.</summary>
     public Task WriteTo(Stream target, CancellationToken ct) =>

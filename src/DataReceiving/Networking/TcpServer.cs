@@ -59,6 +59,9 @@ public class TcpServer
     {
         using (client)
         {
+            _metrics?.ConnectionOpened();
+            try
+            {
             var stream = client.GetStream();
             while (!ct.IsCancellationRequested)
             {
@@ -103,6 +106,11 @@ public class TcpServer
                     _metrics?.ObserveFrame("rejected", "unknown", Stopwatch.GetElapsedTime(startTs).TotalSeconds);
                     await SendAckAsync(stream, ackStatus, (byte)result.Error.Stage, ct);
                 }
+            }
+            }
+            finally
+            {
+                _metrics?.ConnectionClosed();
             }
         }
     }
