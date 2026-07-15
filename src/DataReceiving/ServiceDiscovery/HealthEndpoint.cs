@@ -46,20 +46,29 @@ public sealed class HealthEndpoint : BackgroundService
                     break;
                 }
 
-                var path = ctx.Request.Url?.AbsolutePath ?? "/";
-                if (path.StartsWith("/metrics", StringComparison.Ordinal))
+                try
                 {
-                    await HandleMetricsAsync(ctx, ct);
+                    var path = ctx.Request.Url?.AbsolutePath ?? "/";
+                    if (path.StartsWith("/metrics", StringComparison.Ordinal))
+                    {
+                        await HandleMetricsAsync(ctx, ct);
+                    }
+                    else
+                    {
+                        var (status, body) = CheckHealth();
+                        var bytes = Encoding.UTF8.GetBytes(body);
+                        ctx.Response.StatusCode = status;
+                        ctx.Response.ContentType = "application/json";
+                        ctx.Response.ContentLength64 = bytes.Length;
+                        await ctx.Response.OutputStream.WriteAsync(bytes, ct);
+                        ctx.Response.Close();
+                    }
                 }
-                else
+                catch (OperationCanceledException) { throw; }
+                catch (Exception ex)
                 {
-                    var (status, body) = CheckHealth();
-                    var bytes = Encoding.UTF8.GetBytes(body);
-                    ctx.Response.StatusCode = status;
-                    ctx.Response.ContentType = "application/json";
-                    ctx.Response.ContentLength64 = bytes.Length;
-                    await ctx.Response.OutputStream.WriteAsync(bytes, ct);
-                    ctx.Response.Close();
+                    _logger.LogWarning(ex, "Error handling health/metrics request (client likely disconnected)");
+                    try { ctx.Response.Abort(); } catch { /* client already gone */ }
                 }
             }
         }

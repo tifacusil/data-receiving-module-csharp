@@ -78,33 +78,41 @@ public class TcpServer
                 }
 
                 var startTs = Stopwatch.GetTimestamp();
-                var result = _parser.Parse(rawFrame);
-                Interlocked.Increment(ref _totalFrames);
-
-                if (result.Success && result.Envelope is not null)
+                try
                 {
-                    CountSensorType(result.Envelope.SensorType);
-                    _logger.LogDebug("frame parsed: {Type}/{SensorId} ({ProjectId}) msg={MsgId} size={Size}B",
-                        result.Envelope.SensorType, result.Envelope.SensorId,
-                        result.Envelope.ProjectId, result.Envelope.MessageId[..8], rawFrame.Length);
+                    var result = _parser.Parse(rawFrame);
+                    Interlocked.Increment(ref _totalFrames);
 
-                    await _sink.WriteAsync(result.Envelope, ct);
-                    _metrics?.IncPublished();
-                    _metrics?.ObserveFrame("ok", result.Envelope.SensorType, Stopwatch.GetElapsedTime(startTs).TotalSeconds);
-                    await SendAckAsync(stream, 0x00, 0x00, ct);
+                    if (result.Success && result.Envelope is not null)
+                    {
+                        CountSensorType(result.Envelope.SensorType);
+                        _logger.LogDebug("frame parsed: {Type}/{SensorId} ({ProjectId}) msg={MsgId} size={Size}B",
+                            result.Envelope.SensorType, result.Envelope.SensorId,
+                            result.Envelope.ProjectId, result.Envelope.MessageId[..8], rawFrame.Length);
+
+                        await _sink.WriteAsync(result.Envelope, ct);
+                        _metrics?.IncPublished();
+                        _metrics?.ObserveFrame("ok", result.Envelope.SensorType, Stopwatch.GetElapsedTime(startTs).TotalSeconds);
+                        await SendAckAsync(stream, 0x00, 0x00, ct);
+                    }
+                    else if (result.Error is not null)
+                    {
+                        Interlocked.Increment(ref _dlxCount);
+                        byte ackStatus = AckStatus(result.Error.Stage);
+                        string hexPreview = Convert.ToHexString(rawFrame, 0, Math.Min(16, rawFrame.Length));
+                        _logger.LogWarning("frame rejected: stage={Stage} error={Error} raw={Hex}",
+                            result.Error.Stage, result.Error.Message, hexPreview);
+
+                        await _dlx.WriteAsync(rawFrame, result.Error, ct);
+                        _metrics?.IncDropped();
+                        _metrics?.ObserveFrame("rejected", "unknown", Stopwatch.GetElapsedTime(startTs).TotalSeconds);
+                        await SendAckAsync(stream, ackStatus, (byte)result.Error.Stage, ct);
+                    }
                 }
-                else if (result.Error is not null)
+                catch (Exception ex) when (ex is not OperationCanceledException)
                 {
-                    Interlocked.Increment(ref _dlxCount);
-                    byte ackStatus = AckStatus(result.Error.Stage);
-                    string hexPreview = Convert.ToHexString(rawFrame, 0, Math.Min(16, rawFrame.Length));
-                    _logger.LogWarning("frame rejected: stage={Stage} error={Error} raw={Hex}",
-                        result.Error.Stage, result.Error.Message, hexPreview);
-
-                    await _dlx.WriteAsync(rawFrame, result.Error, ct);
-                    _metrics?.IncDropped();
-                    _metrics?.ObserveFrame("rejected", "unknown", Stopwatch.GetElapsedTime(startTs).TotalSeconds);
-                    await SendAckAsync(stream, ackStatus, (byte)result.Error.Stage, ct);
+                    _logger.LogError(ex, "Error processing frame from client; closing connection");
+                    break;
                 }
             }
             }
