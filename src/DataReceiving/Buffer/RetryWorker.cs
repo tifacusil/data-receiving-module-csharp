@@ -37,10 +37,6 @@ public sealed class RetryWorker : BackgroundService
 
     internal async Task RunRetryPassAsync(TimeSpan minAge, CancellationToken ct)
     {
-        var count = await _buffer.CountAsync(ct);
-        if (count > 0)
-            _logger.LogInformation("retry pass: {Count} messages in redis buffer", count);
-
         var retried = 0;
         var succeeded = 0;
 

@@ -11,6 +11,7 @@ namespace DataReceiving.Buffer;
 public sealed class RedisMessageBuffer : IMessageBuffer
 {
     private const string KeyPrefix = "sensor_buffer:";
+    private const int ScanPageSize = 100;
 
     private readonly IDatabase _db;
     private readonly IServer _server;
@@ -42,21 +43,44 @@ public sealed class RedisMessageBuffer : IMessageBuffer
         _logger.LogDebug("buffered msg={MessageId} key={Key}", messageId, key);
     }
 
-    public async Task DeleteAsync(string messageId, CancellationToken ct)
+    public Task DeleteAsync(string messageId, CancellationToken ct)
     {
+        // Fire-and-forget: the delete is off the hot path's latency budget. If it
+        // is lost, the retry worker republishes and downstream INSERT IGNORE dedups.
         var key = KeyPrefix + messageId;
-        await _db.KeyDeleteAsync(key);
+        return _db.KeyDeleteAsync(key, CommandFlags.FireAndForget);
     }
 
     public async IAsyncEnumerable<BufferedMessage> ScanOldAsync(TimeSpan minAge, [EnumeratorCancellation] CancellationToken ct)
     {
         var cutoff = DateTime.UtcNow - minAge;
+        var page = new List<RedisKey>(ScanPageSize);
 
-        foreach (var key in _server.Keys(pattern: KeyPrefix + "*", pageSize: 100))
+        await foreach (var key in _server.KeysAsync(pattern: KeyPrefix + "*", pageSize: ScanPageSize).WithCancellation(ct))
         {
-            ct.ThrowIfCancellationRequested();
+            page.Add(key);
+            if (page.Count < ScanPageSize) continue;
 
-            var value = await _db.StringGetAsync(key);
+            foreach (var msg in await ReadBatchAsync(page, cutoff))
+                yield return msg;
+            page.Clear();
+        }
+
+        if (page.Count > 0)
+        {
+            foreach (var msg in await ReadBatchAsync(page, cutoff))
+                yield return msg;
+        }
+    }
+
+    // One MGET per page instead of one GET round-trip per key.
+    private async Task<List<BufferedMessage>> ReadBatchAsync(List<RedisKey> keys, DateTime cutoff)
+    {
+        var result = new List<BufferedMessage>();
+        var values = await _db.StringGetAsync(keys.ToArray());
+
+        foreach (var value in values)
+        {
             if (value.IsNullOrEmpty) continue;
 
             BufferWrapper? wrapper;
@@ -65,16 +89,17 @@ public sealed class RedisMessageBuffer : IMessageBuffer
 
             if (wrapper is null || wrapper.StoredAt > cutoff) continue;
 
-            yield return new BufferedMessage(wrapper.MessageId, wrapper.RoutingKey, wrapper.EnvelopeJson, wrapper.StoredAt);
+            result.Add(new BufferedMessage(wrapper.MessageId, wrapper.RoutingKey, wrapper.EnvelopeJson, wrapper.StoredAt));
         }
+        return result;
     }
 
-    public Task<long> CountAsync(CancellationToken ct)
+    public async Task<long> CountAsync(CancellationToken ct)
     {
         long count = 0;
-        foreach (var _ in _server.Keys(pattern: KeyPrefix + "*", pageSize: 100))
+        await foreach (var _ in _server.KeysAsync(pattern: KeyPrefix + "*", pageSize: ScanPageSize).WithCancellation(ct))
             count++;
-        return Task.FromResult(count);
+        return count;
     }
 
     private sealed class BufferWrapper

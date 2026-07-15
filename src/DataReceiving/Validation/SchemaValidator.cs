@@ -6,6 +6,8 @@ namespace DataReceiving.Validation;
 
 public class SchemaValidator
 {
+    private static readonly EvaluationOptions EvalOptions = new() { OutputFormat = OutputFormat.List };
+
     private readonly JsonSchema _envelopeSchema;
     private readonly IReadOnlyDictionary<string, JsonSchema> _payloadSchemas;
 
@@ -28,9 +30,7 @@ public class SchemaValidator
         if (node is null)
             return (false, "Failed to parse envelope JSON");
 
-        var evalOptions = new EvaluationOptions { OutputFormat = OutputFormat.List };
-
-        var envResult = _envelopeSchema.Evaluate(node, evalOptions);
+        var envResult = _envelopeSchema.Evaluate(node, EvalOptions);
         if (!envResult.IsValid)
             return (false, FormatErrors(envResult));
 
@@ -40,7 +40,7 @@ public class SchemaValidator
             if (payloadNode is null)
                 return (false, "Missing 'payload' in envelope");
 
-            var payloadResult = payloadSchema.Evaluate(payloadNode, evalOptions);
+            var payloadResult = payloadSchema.Evaluate(payloadNode, EvalOptions);
             if (!payloadResult.IsValid)
                 return (false, FormatErrors(payloadResult));
         }

@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -6,6 +7,10 @@ namespace DataReceiving.Parsing;
 public static class EnvelopeSerializer
 {
     private static readonly JsonSerializerOptions Options = BuildOptions();
+
+    // The same envelope instance is serialized once for schema validation and
+    // again when publishing; cache per instance so the JSON is produced once.
+    private static readonly ConditionalWeakTable<SensorEnvelope, string> JsonCache = new();
 
     private static JsonSerializerOptions BuildOptions()
     {
@@ -19,11 +24,8 @@ public static class EnvelopeSerializer
         return opts;
     }
 
-    public static string Serialize(SensorEnvelope envelope)
-    {
-        var dto = new EnvelopeDto(envelope);
-        return JsonSerializer.Serialize(dto, Options);
-    }
+    public static string Serialize(SensorEnvelope envelope) =>
+        JsonCache.GetValue(envelope, static e => JsonSerializer.Serialize(new EnvelopeDto(e), Options));
 
     // Flat DTO so System.Text.Json can serialize the polymorphic payload properly.
     private class EnvelopeDto
